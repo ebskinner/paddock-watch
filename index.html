@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paddock Watch</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<style>
+  :root{ --bg:#12181b; --panel:#1b2429f2; --card:#232f35; --line:#2d3a42; --fg:#eceff1; --muted:#90a4ae; --gold:#ffd24a; --shadow:0 6px 24px rgba(0,0,0,.45); color-scheme:dark; }
+  *{box-sizing:border-box} html,body{height:100%;margin:0}
+  body{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);overflow:hidden}
+  #map{position:absolute;inset:0;background:var(--bg)}
+  #modebar{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:1001;display:flex;gap:4px;background:var(--panel);
+    backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:28px;padding:4px;box-shadow:var(--shadow)}
+  #modebar button{border:none;background:transparent;color:var(--muted);padding:8px 15px;border-radius:22px;font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}
+  #modebar button.on{background:#2f7d6b;color:#fff}
+  #panel{position:absolute;top:64px;left:12px;z-index:1000;width:min(320px,calc(100vw - 24px));max-height:calc(100% - 80px);overflow:auto;
+    background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);padding:14px}
+  h1{font-size:15px;margin:0 0 1px} .sub{color:var(--muted);font-size:12px;margin:0 0 10px}
+  .legtitle{font-size:12px;font-weight:700;margin:4px 0 6px}
+  .ramp{height:14px;border-radius:4px;border:1px solid var(--line)}
+  .ramplab{display:flex;justify-content:space-between;font-size:11px;color:var(--fg);margin-top:3px;font-variant-numeric:tabular-nums}
+  .sel{margin-top:12px;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:8px}
+  .sel .big{font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums}
+  .note{font-size:11px;color:var(--muted);margin-top:8px}
+  #status{position:absolute;left:12px;bottom:12px;z-index:1000;max-width:calc(100vw - 24px);background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:6px 10px;font-size:12px;color:var(--muted);box-shadow:var(--shadow)}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="modebar">
+  <button class="on" data-mode="cover">🌾 Ground cover</button>
+  <button data-mode="temp">🌡️ Temperature</button>
+  <button data-mode="water">💧 Water</button>
+</div>
+<div id="panel">
+  <h1>Paddock Watch</h1>
+  <p class="sub" id="sub">Loading property…</p>
+  <div id="legend"></div>
+  <div class="sel" id="sel"><span class="note">Click a grid cell to read its exact value.</span></div>
+  <p class="note" id="built"></p>
+</div>
+<div id="status">Starting…</div>
+
+<script>
+const DEA_WMS="https://ows.dea.ga.gov.au/wms";
+const WATER_LAYER="ga_ls_wo_fq_myear_3";           // DEA "how often wet" summary
+let map, gridData=null, gridLayer=null, waterLayer=null, mode="cover";
+const msg=t=>document.getElementById("status").textContent=t;
+
+map=L.map("map",{zoomControl:true}).setView([-26.7,142.6],9);
+L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{maxZoom:19,attribution:"Imagery © Esri"}).addTo(map);
+
+/* ---- colour scales ---- */
+function coverColor(v){ if(v==null)return "#5b6b73";
+  return v>=80?"#1a9850":v>=65?"#66bd63":v>=50?"#a6d96a":v>=35?"#fee08b":v>=20?"#fdae61":v>=10?"#f46d43":"#d73027"; }
+function tempColor(v){ if(v==null)return "#5b6b73"; const t=Math.max(-5,Math.min(55,v)),x=(t+5)/60;
+  const stops=[[0,"#30123b"],[.2,"#4675ed"],[.4,"#1bcfd4"],[.55,"#a4fc3b"],[.7,"#f3c63a"],[.85,"#fe9b2d"],[1,"#7a0403"]];
+  for(let i=1;i<stops.length;i++) if(x<=stops[i][0]) return stops[i][1]; return "#7a0403"; }
+
+const LEG={
+  cover:`<div class="legtitle">Ground cover (% of each cell, DEA)</div>
+    <div class="ramp" style="background:linear-gradient(90deg,#d73027,#f46d43,#fdae61,#fee08b,#a6d96a,#66bd63,#1a9850)"></div>
+    <div class="ramplab"><span>0%</span><span>50%</span><span>100%</span></div>
+    <div class="note">Live feed plus dry standing grass. Red = bare.</div>`,
+  temp:`<div class="legtitle">Surface temperature (°C, Landsat ~100 m)</div>
+    <div class="ramp" style="background:linear-gradient(90deg,#30123b,#4675ed,#1bcfd4,#a4fc3b,#f3c63a,#fe9b2d,#7a0403)"></div>
+    <div class="ramplab"><span>-5</span><span>25</span><span>55</span></div>
+    <div class="note">Ground skin temp, not shade air temp.</div>`,
+  water:`<div class="legtitle">Where water collects (1986–now, DEA)</div>
+    <div class="ramp" style="background:linear-gradient(90deg,#f7fbff,#c6dbef,#6baed6,#2171b5,#08306b)"></div>
+    <div class="ramplab"><span>after rain</span><span>always wet</span></div>
+    <div class="note">Every dam, hole and channel. Live from DEA.</div>`
+};
+
+function styleCell(f){ const p=f.properties;
+  const c = mode==="temp" ? tempColor(p.temp_c) : coverColor(p.cover_pct);
+  return {fillColor:c,color:"#101417",weight:.6,fillOpacity:.78}; }
+function onCell(f,layer){ layer.on("click",()=>{ const p=f.properties;
+  const html = mode==="temp"
+    ? `<div class="big">${p.temp_c==null?"—":p.temp_c+" °C"}</div><span class="note">${p.cell_id} · scene ${p.temp_date||"?"}</span>`
+    : `<div class="big">${p.cover_pct==null?"—":p.cover_pct+"% cover"}</div><span class="note">${p.cell_id} · green ${p.green_pct==null?"?":p.green_pct}% · scene ${p.fc_date||"?"}</span>`;
+  document.getElementById("sel").innerHTML=html; }); }
+
+function showGrid(){
+  if(waterLayer){ map.removeLayer(waterLayer); waterLayer=null; }
+  if(!gridData){ return; }
+  if(gridLayer) map.removeLayer(gridLayer);
+  gridLayer=L.geoJSON(gridData,{style:styleCell,onEachFeature:onCell}).addTo(map);
+}
+function showWater(){
+  if(gridLayer){ map.removeLayer(gridLayer); gridLayer=null; }
+  if(waterLayer) map.removeLayer(waterLayer);
+  waterLayer=L.tileLayer.wms(DEA_WMS,{layers:WATER_LAYER,format:"image/png",transparent:true,version:"1.3.0",opacity:.85,attribution:"DEA / Geoscience Australia"}).addTo(map);
+}
+function setMode(m){ mode=m;
+  document.querySelectorAll("#modebar button").forEach(b=>b.classList.toggle("on",b.dataset.mode===m));
+  document.getElementById("legend").innerHTML=LEG[m];
+  document.getElementById("sel").innerHTML='<span class="note">Click a grid cell to read its exact value.</span>';
+  if(m==="water") showWater(); else showGrid();
+}
+document.querySelectorAll("#modebar button").forEach(b=>b.addEventListener("click",()=>setMode(b.dataset.mode)));
+
+/* ---- load the precomputed data (built by GitHub Actions) ---- */
+async function boot(){
+  setMode("cover");
+  try{ const pr=await fetch("app_data/property.geojson",{cache:"no-store"}); if(pr.ok){
+      const g=await pr.json(); const lyr=L.geoJSON(g,{style:{color:"#ffd24a",weight:2.5,fill:false}}).addTo(map);
+      map.fitBounds(lyr.getBounds(),{padding:[30,30]}); } }catch(e){}
+  try{ const r=await fetch("app_data/cover_grid.geojson",{cache:"no-store"});
+    if(!r.ok) throw new Error("not built yet");
+    gridData=await r.json(); showGrid();
+    const p0=(gridData.features[0]||{}).properties||{};
+    document.getElementById("sub").textContent="Plevna Downs · "+gridData.features.length+" cells";
+    document.getElementById("built").textContent="Cover scene "+(p0.fc_date||"?")+(p0.temp_date?("  ·  temp "+p0.temp_date):"");
+    msg("Ready.");
+  }catch(e){
+    document.getElementById("sub").textContent="Grid not built yet";
+    document.getElementById("built").innerHTML='No data file found. In GitHub, open the <b>Actions</b> tab, pick <b>Build paddock grid</b>, and click <b>Run workflow</b>. It appears here when it finishes.';
+    msg("Waiting for first data build.");
+  }
+}
+boot();
+</script>
+</body>
+</html>
