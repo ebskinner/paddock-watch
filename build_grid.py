@@ -114,6 +114,38 @@ try:
 except Exception as e:
     log("Temperature step failed:", e); traceback.print_exc()
 
+# -------------------------------------------------- 4b. SILO rainfall per cell (~5 km)
+# SILO gridded monthly rainfall GeoTIFF on AWS Open Data (EPSG:4326). The property
+# is ~48 km N-S, so it spans several 5 km pixels and rain really does vary across it.
+# Try the current month, then the previous month; try both known path prefixes.
+def silo_monthly_rain_tif():
+    prefixes = [
+        "https://s3-ap-southeast-2.amazonaws.com/silo-open-data/Official/monthly/monthly_rain/",
+        "https://s3-ap-southeast-2.amazonaws.com/silo-open-data/monthly/monthly_rain/",
+    ]
+    months = [END, (END.replace(day=1) - timedelta(days=1))]   # this month, last month
+    for m in months:
+        for p in prefixes:
+            url = f"{p}{m.year}/{m.year}{m.month:02d}.monthly_rain.tif"
+            try:
+                rasterio.open(f"/vsicurl/{url}")   # cheap open to test existence
+                return url, f"{m.year}-{m.month:02d}"
+            except Exception:
+                continue
+    return None, None
+
+try:
+    tif, rmonth = silo_monthly_rain_tif()
+    if not tif:
+        raise RuntimeError("no SILO monthly raster found")
+    crs = rasterio.open(f"/vsicurl/{tif}").crs
+    rain = zonal_mean(tif, crs, None)
+    grid["rain_mm"]    = [None if r is None else round(r, 1) for r in rain]
+    grid["rain_month"] = rmonth
+    log(f"Rainfall from SILO monthly grid {rmonth}")
+except Exception as e:
+    log("Rainfall step failed:", e); traceback.print_exc()
+
 # -------------------------------------------------- 5. write grid (WGS84 for the map)
 grid.to_crs(4326).to_file(f"{OUT}/cover_grid.geojson", driver="GeoJSON")
 log("Wrote cover_grid.geojson with columns:", [c for c in grid.columns if c != "geometry"])

@@ -33,6 +33,7 @@
 <div id="modebar">
   <button class="on" data-mode="cover">🌾 Ground cover</button>
   <button data-mode="temp">🌡️ Temperature</button>
+  <button data-mode="rain">🌧️ Rainfall</button>
   <button data-mode="water">💧 Water</button>
 </div>
 <div id="panel">
@@ -59,6 +60,8 @@ function coverColor(v){ if(v==null)return "#5b6b73";
 function tempColor(v){ if(v==null)return "#5b6b73"; const t=Math.max(-5,Math.min(55,v)),x=(t+5)/60;
   const stops=[[0,"#30123b"],[.2,"#4675ed"],[.4,"#1bcfd4"],[.55,"#a4fc3b"],[.7,"#f3c63a"],[.85,"#fe9b2d"],[1,"#7a0403"]];
   for(let i=1;i<stops.length;i++) if(x<=stops[i][0]) return stops[i][1]; return "#7a0403"; }
+function rainColor(v){ if(v==null)return "#5b6b73";
+  return v>=150?"#08306b":v>=100?"#2171b5":v>=60?"#4292c6":v>=30?"#6baed6":v>=15?"#9ecae1":v>=5?"#c6dbef":"#f7fbff"; }
 
 const LEG={
   cover:`<div class="legtitle">Ground cover (% of each cell, DEA)</div>
@@ -69,6 +72,10 @@ const LEG={
     <div class="ramp" style="background:linear-gradient(90deg,#30123b,#4675ed,#1bcfd4,#a4fc3b,#f3c63a,#fe9b2d,#7a0403)"></div>
     <div class="ramplab"><span>-5</span><span>25</span><span>55</span></div>
     <div class="note">Ground skin temp, not shade air temp.</div>`,
+  rain:`<div class="legtitle">Rainfall this month (mm, SILO ~5 km)</div>
+    <div class="ramp" style="background:linear-gradient(90deg,#f7fbff,#c6dbef,#9ecae1,#6baed6,#4292c6,#2171b5,#08306b)"></div>
+    <div class="ramplab"><span>0</span><span>60</span><span>150+</span></div>
+    <div class="note">Coarse (5 km), so it varies gently along the property, not paddock to paddock.</div>`,
   water:`<div class="legtitle">Where water collects (1986–now, DEA)</div>
     <div class="ramp" style="background:linear-gradient(90deg,#f7fbff,#c6dbef,#6baed6,#2171b5,#08306b)"></div>
     <div class="ramplab"><span>after rain</span><span>always wet</span></div>
@@ -76,12 +83,13 @@ const LEG={
 };
 
 function styleCell(f){ const p=f.properties;
-  const c = mode==="temp" ? tempColor(p.temp_c) : coverColor(p.cover_pct);
+  const c = mode==="temp" ? tempColor(p.temp_c) : mode==="rain" ? rainColor(p.rain_mm) : coverColor(p.cover_pct);
   return {fillColor:c,color:"#101417",weight:.6,fillOpacity:.78}; }
 function onCell(f,layer){ layer.on("click",()=>{ const p=f.properties;
-  const html = mode==="temp"
-    ? `<div class="big">${p.temp_c==null?"—":p.temp_c+" °C"}</div><span class="note">${p.cell_id} · scene ${p.temp_date||"?"}</span>`
-    : `<div class="big">${p.cover_pct==null?"—":p.cover_pct+"% cover"}</div><span class="note">${p.cell_id} · green ${p.green_pct==null?"?":p.green_pct}% · scene ${p.fc_date||"?"}</span>`;
+  let html;
+  if(mode==="temp") html=`<div class="big">${p.temp_c==null?"—":p.temp_c+" °C"}</div><span class="note">${p.cell_id} · scene ${p.temp_date||"?"}</span>`;
+  else if(mode==="rain") html=`<div class="big">${p.rain_mm==null?"—":p.rain_mm+" mm"}</div><span class="note">${p.cell_id} · ${p.rain_month||"?"} (SILO 5 km)</span>`;
+  else html=`<div class="big">${p.cover_pct==null?"—":p.cover_pct+"% cover"}</div><span class="note">${p.cell_id} · green ${p.green_pct==null?"?":p.green_pct}% · scene ${p.fc_date||"?"}</span>`;
   document.getElementById("sel").innerHTML=html; }); }
 
 function showGrid(){
