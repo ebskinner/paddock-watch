@@ -70,10 +70,18 @@ grid = grid[~grid.is_empty].reset_index(drop=True)
 grid["cell_id"] = [f"C{i:03d}" for i in range(len(grid))]
 log(f"Grid: {len(grid)} cells of ~{CELL_M*CELL_M/1e4:.0f} ha")
 
+def to_https(href):
+    """DEA assets come back as s3:// URLs that GDAL's /vsicurl/ can't read.
+    Rewrite to the public https virtual-hosted form (bucket in ap-southeast-2)."""
+    if href.startswith("s3://"):
+        bucket, _, key = href[5:].partition("/")
+        return f"https://{bucket}.s3.ap-southeast-2.amazonaws.com/{key}"
+    return href
+
 def zonal_mean(href, crs, nodata):
     """Mean raster value per grid cell (grid reprojected to the raster's CRS)."""
     g = grid.to_crs(crs)
-    stats = zonal_stats(g, f"/vsicurl/{href}", stats=["mean"], nodata=nodata, all_touched=True)
+    stats = zonal_stats(g, f"/vsicurl/{to_https(href)}", stats=["mean"], nodata=nodata, all_touched=True)
     return [None if s["mean"] is None else s["mean"] for s in stats]
 
 # -------------------------------------------------- 3. DEA Fractional Cover -> cover %
@@ -82,7 +90,7 @@ try:
     items = list(dea.search(collections=["ga_ls_fc_3"], bbox=bbox,
                             datetime=f"{START}/{END}").items())
     it = max(items, key=lambda i: i.datetime)
-    crs = rasterio.open(f"/vsicurl/{it.assets['bs'].href}").crs
+    crs = rasterio.open(f"/vsicurl/{to_https(it.assets['bs'].href)}").crs
     bs = zonal_mean(it.assets["bs"].href, crs, 255)     # bare soil %
     pv = zonal_mean(it.assets["pv"].href, crs, 255)     # green veg %
     grid["cover_pct"] = [None if b is None else round(100 - b) for b in bs]   # total ground cover
