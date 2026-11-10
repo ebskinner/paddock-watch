@@ -1,0 +1,36 @@
+name: Build paddock grid
+
+# Runs weekly (and on demand), rebuilds the real grid data, commits it back.
+on:
+  workflow_dispatch:            # lets you run it by hand from the Actions tab
+  schedule:
+    - cron: "0 20 * * 1"        # Mondays 20:00 UTC (~6am Tue Brisbane)
+
+permissions:
+  contents: write               # allows the job to commit the refreshed data
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install geospatial libraries
+        run: pip install geopandas rasterio rasterstats pystac-client planetary-computer shapely pyproj requests
+
+      - name: Build the grid from live DEA data
+        env:
+          LOTS: "6SP196201"            # your lot/plan(s), comma-separated
+          CELL_M: "1000"              # grid cell size in metres
+          SILO_EMAIL: ${{ secrets.SILO_EMAIL }}   # optional, for rainfall
+        run: python build_grid.py
+
+      - name: Commit refreshed data
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update paddock grid data"
+          file_pattern: "app_data/*.geojson app_data/*.txt"
