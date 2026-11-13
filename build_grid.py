@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-build_grid.py  -  real gridded paddock condition, weekly, for several properties.
+build_grid.py  -  real gridded paddock condition for several properties.
 
-Per grid cell, for each of the last 4 weekly windows (w0 = this week .. w3):
-  cover_wN / green_wN / coverdate_wN   DEA fractional cover
-  temp_wN  / tempdate_wN               Landsat surface temperature
-  rain_wN                              SILO daily rainfall totalled over the week
-Plus one static layer:
-  wet_pct                              DEA Water Observations: how often wet (all years)
+Per grid cell, indexed by the ACTUAL satellite pass date (newest first, up to 5):
+  cover_dN / green_dN / coverdate_dN   DEA fractional cover for that pass
+  temp_dN  / tempdate_dN               Landsat surface temperature for that pass
+Plus weekly rainfall (SILO daily totalled per week), rain_wN with weeklabel_wN.
 
-Cover and temperature are stitched PER CELL from the most recent clear scene that
-actually covers that cell, so a property crossing a Landsat tile edge fills right
-across, and a week with no pass still shows the latest reading. Non-overlapping
-tiles contribute only the cells they cover.
+Each date slot is one real acquisition (tiles from the same day mosaicked across
+the property). No carry-forward, so stepping the slider always moves to a genuinely
+different satellite pass, labelled with the day it was taken. A cell is blank for a
+date only if that pass did not image it.
+
+cover = 100 - bare. green = photosynthetic fraction. dry = cover - green. In arid
+country cover is mostly dry material, so the viewer also shows the green/dry/bare split.
 
 Writes per property key into app_data/: <key>_grid.geojson, <key>_property.geojson
 Runs on GitHub Actions. No invented numbers.
 """
 import os, traceback
+from collections import OrderedDict
 from datetime import date, timedelta
 
 import requests
@@ -39,8 +41,9 @@ OUT      = "app_data"; os.makedirs(OUT, exist_ok=True)
 ALBERS   = 3577
 END      = date.today()
 WEEKS    = [(END - timedelta(days=7*(i+1)), END - timedelta(days=7*i)) for i in range(4)]
-LOOKBACK = 45
-MAX_SCENES = 10                     # per layer per property (enough to mosaic 2 tiles x a few dates)
+LOOKBACK = 70                       # days back to gather satellite passes
+MAX_DATES = 5                       # how many recent pass dates to keep per layer
+MAX_SCENES = 16                     # safety cap on scene reads per layer
 SILO_DAILY = "https://s3-ap-southeast-2.amazonaws.com/silo-open-data/Official/daily/daily_rain/"
 WGS84 = CRS.from_epsg(4326)
 
@@ -84,66 +87,55 @@ def zvals(grid, href, crs, nodata):
 dea = Client.open("https://explorer.dea.ga.gov.au/stac")
 mpc = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1", modifier=pc.sign_inplace)
 
-def scenes_cover(grid, bbox):
-    """Newest-first (date, cover_list, green_list) for FC scenes that cover >0 cells."""
+def cover_by_date(grid, bbox, n):
+    """OrderedDict date(newest first) -> (cover_list, green_list), tiles mosaicked."""
     items = sorted(dea.search(collections=["ga_ls_fc_3"], bbox=bbox,
                    datetime=f"{END-timedelta(days=LOOKBACK)}/{END}").items(),
                    key=lambda x: x.datetime, reverse=True)
-    out = []
+    out = OrderedDict(); reads = 0
     for it in items:
+        d = it.datetime.date()
+        if d not in out and len(out) >= MAX_DATES: continue
         try:
             crs = rasterio.open(f"/vsicurl/{to_https(it.assets['bs'].href)}").crs
-            bs = zvals(grid, it.assets["bs"].href, crs, 255)
-            if not any(v is not None for v in bs):
-                continue
+            bs = zvals(grid, it.assets["bs"].href, crs, 255); reads += 1
+            if not any(v is not None for v in bs): continue
             pv = zvals(grid, it.assets["pv"].href, crs, 255)
-            out.append((it.datetime.date(),
-                        [None if b is None else round(100 - b) for b in bs],
-                        [None if p is None else round(p) for p in pv]))
-            if len(out) >= MAX_SCENES: break
+            cov = [None if b is None else round(100-b) for b in bs]
+            grn = [None if p is None else round(p) for p in pv]
+            if d not in out: out[d] = (cov[:], grn[:])
+            else:
+                C, G = out[d]
+                for j in range(n):
+                    if C[j] is None and cov[j] is not None: C[j] = cov[j]; G[j] = grn[j]
+            if reads >= MAX_SCENES: break
         except Exception as e:
             log("  cover scene skipped:", e)
     return out
 
-def scenes_temp(grid, bbox):
-    """Newest-first (date, temp_list) for Landsat scenes that cover >0 cells."""
+def temp_by_date(grid, bbox, n):
     items = sorted(mpc.search(collections=["landsat-c2-l2"], bbox=bbox,
                    datetime=f"{END-timedelta(days=LOOKBACK)}/{END}",
                    query={"eo:cloud_cover": {"lt": 60}}).items(),
                    key=lambda x: x.datetime, reverse=True)
-    out = []
+    out = OrderedDict(); reads = 0
     for it in items:
+        d = it.datetime.date()
+        if d not in out and len(out) >= MAX_DATES: continue
         try:
             crs = rasterio.open(f"/vsicurl/{it.assets['lwir11'].href}").crs
-            dn = zvals(grid, it.assets["lwir11"].href, crs, 0)
-            if not any(v is not None for v in dn):
-                continue
-            out.append((it.datetime.date(),
-                        [None if d is None else round(d*0.00341802 + 149.0 - 273.15, 1) for d in dn]))
-            if len(out) >= MAX_SCENES: break
+            dn = zvals(grid, it.assets["lwir11"].href, crs, 0); reads += 1
+            if not any(v is not None for v in dn): continue
+            t = [None if v is None else round(v*0.00341802 + 149.0 - 273.15, 1) for v in dn]
+            if d not in out: out[d] = t
+            else:
+                T = out[d]
+                for j in range(n):
+                    if T[j] is None and t[j] is not None: T[j] = t[j]
+            if reads >= MAX_SCENES: break
         except Exception as e:
             log("  temp scene skipped:", e)
     return out
-
-def water_frequency(grid, bbox, n):
-    """Per-cell 'how often wet' (%) from DEA Water Observations multi-year summary."""
-    wet = [None]*n
-    try:
-        items = list(dea.search(collections=["ga_ls_wo_fq_myear_3"], bbox=bbox).items())
-        for it in items:
-            asset = it.assets.get("frequency") or next((a for k, a in it.assets.items()
-                     if getattr(a, "href", "").endswith(".tif")), None)
-            if asset is None: continue
-            crs = rasterio.open(f"/vsicurl/{to_https(asset.href)}").crs
-            vals = zvals(grid, asset.href, crs, None)
-            for j, v in enumerate(vals):
-                if wet[j] is None and v is not None:
-                    wet[j] = v
-        # frequency is 0..1
-        return [None if w is None else round(w*100) for w in wet]
-    except Exception as e:
-        log("  water step failed:", e)
-        return wet
 
 for key, meta in PROPERTIES.items():
     try:
@@ -151,33 +143,22 @@ for key, meta in PROPERTIES.items():
         prop = gpd.GeoDataFrame(geometry=[cadastre(meta["lots"])], crs=4326)
         prop.to_file(f"{OUT}/{key}_property.geojson", driver="GeoJSON")
         prop_al = prop.to_crs(ALBERS)
-        grid = make_grid(prop_al)
-        n = len(grid)
+        grid = make_grid(prop_al); n = len(grid)
         bbox = [float(v) for v in prop.total_bounds]
         log(f"{key}: {n} cells, {prop_al.area.iloc[0]/1e4:,.0f} ha")
 
-        cov = scenes_cover(grid, bbox)
-        tmp = scenes_temp(grid, bbox)
-        log(f"{key}: {len(cov)} cover scenes, {len(tmp)} temp scenes")
+        cov = cover_by_date(grid, bbox, n)
+        for i, d in enumerate(list(cov.keys())[:MAX_DATES]):
+            C, G = cov[d]
+            grid[f"cover_d{i}"] = C; grid[f"green_d{i}"] = G; grid[f"coverdate_d{i}"] = str(d)
+        log(f"{key}: cover dates {list(cov.keys())[:MAX_DATES]}")
+
+        tmp = temp_by_date(grid, bbox, n)
+        for i, d in enumerate(list(tmp.keys())[:MAX_DATES]):
+            grid[f"temp_d{i}"] = tmp[d]; grid[f"tempdate_d{i}"] = str(d)
+        log(f"{key}: temp dates {list(tmp.keys())[:MAX_DATES]}")
 
         for i, (ws, we) in enumerate(WEEKS):
-            tag = f"w{i}"
-            cle = [c for c in cov if c[0] <= we]   # newest first
-            tle = [t for t in tmp if t[0] <= we]
-            cover_col = [None]*n; green_col = [None]*n; temp_col = [None]*n
-            for j in range(n):                      # per-cell newest covering scene
-                for dt, cL, gL in cle:
-                    if cL[j] is not None:
-                        cover_col[j] = cL[j]; green_col[j] = gL[j]; break
-                for dt, tL in tle:
-                    if tL[j] is not None:
-                        temp_col[j] = tL[j]; break
-            grid[f"cover_{tag}"] = cover_col
-            grid[f"green_{tag}"] = green_col
-            grid[f"temp_{tag}"]  = temp_col
-            grid[f"coverdate_{tag}"] = str(cle[0][0]) if cle else None
-            grid[f"tempdate_{tag}"]  = str(tle[0][0]) if tle else None
-            # rain: SILO daily totalled within the week
             total = None; days = 0; d = ws
             while d < we:
                 u = f"{SILO_DAILY}{d.year}/{d.year}{d.month:02d}{d.day:02d}.daily_rain.tif"
@@ -190,12 +171,9 @@ for key, meta in PROPERTIES.items():
                 except Exception:
                     pass
                 d += timedelta(days=1)
-            grid[f"rain_{tag}"] = [None if total is None else round(total[j], 1) for j in range(n)]
-            log(f"{key} {tag}: cover {sum(v is not None for v in cover_col)}/{n}, "
-                f"temp {sum(v is not None for v in temp_col)}/{n}, rain {days}d")
-
-        grid["wet_pct"] = water_frequency(grid, bbox, n)
-        log(f"{key}: water {sum(v is not None for v in grid['wet_pct'])}/{n}")
+            grid[f"rain_w{i}"] = [None if total is None else round(total[j], 1) for j in range(n)]
+            grid[f"weeklabel_w{i}"] = f"{ws:%d %b}-{we:%d %b}"
+            log(f"{key} w{i} rain: {days} days")
 
         grid.to_crs(4326).to_file(f"{OUT}/{key}_grid.geojson", driver="GeoJSON")
         log(f"{key}: wrote grid")
